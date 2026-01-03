@@ -52,7 +52,9 @@ struct s_icmp{
 typedef struct s_icmp icmp;
 
 
+
 int16 checksum(int8*,int16);//calculate checksum of icmp packet
+int16 endian16(int16);
 
 //icmp
 icmp *mkicmp(type,const int8*,int16);//create icmp packet

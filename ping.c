@@ -1,10 +1,21 @@
 #include "ping.h"
 
+//0xaabb -> 0xbbaa
+int16 endian16(int16 x){
+    int a,b;
+    int16 y;
+    b=(x&0x00ff);
+    a=((x&0xff00)>>8);
+    y=(b<<8)|a;
+    return y;
+}
+
 int16 checksum(int8 *pkt,int16 size){
 
     int16 *p;
     int32 acc,b;
     int16 carry,sum,n;
+    int16 ret;
     acc=0;
 
     for(n=size,p=(int16*)pkt;n;n-=2,p++){
@@ -14,7 +25,9 @@ int16 checksum(int8 *pkt,int16 size){
     carry=(acc&0xffff0000)>>16;//acc for deferred carry
     sum=(acc&0x0000ffff);
 
-    return ~(sum+carry); //1's complement of the sum
+    ret=~(sum+carry); //1's complement of the sum
+    
+    return endian16(ret);
 }
 
 int8 *evalicmp(icmp *pkt){
@@ -112,6 +125,12 @@ int main(int argc,char **argv){
     icmp *pkt;
     int8 *raw;
     int16 size;
+
+    // int16 val,val_;
+    // val=0xaabb;
+    // val_=endian16(val);
+    // printf("%.04hx\n",val_);
+    // return 0;
 
     str=(int8 *)malloc(5);
     assert(str);
