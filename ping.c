@@ -105,17 +105,20 @@ icmp *mkicmp(type kind,const int8 *data,int16 size){
 
 }
 
-void showicmp(icmp *pkt){
+void showicmp(char *ident,icmp *pkt){
     if(!pkt){
         return;
     }
-    printf("kind:\t %s\nsize:\t %d\npayload:\n",(pkt->kind==echo)?"echo":"echo reply",(int)pkt->size);
+    printf("(icmp *)%s = {\n",ident);
+    printf("  kind:\t %s\n",(pkt->kind==echo)?"echo":"echo reply");
+    printf("  size:\t %d\n",(int)pkt->size);
+    printf("  payload:\n");
 
     if (pkt->data){
         printhex(pkt->data,pkt->size,0);
         
     }
-    printf("\n");
+    printf("}\n");
 
     return;
 }
@@ -125,6 +128,11 @@ int main(int argc,char **argv){
     icmp *pkt;
     int8 *raw;
     int16 size;
+    int16 rnd;
+
+    (void)rnd;
+    srand(getpid());
+    rnd=(rand()%50000);
 
     // int16 val,val_;
     // val=0xaabb;
@@ -139,7 +147,7 @@ int main(int argc,char **argv){
 
     pkt=mkicmp(echo,str,5);
     assert(pkt);
-    showicmp(pkt);
+    show(pkt);
 
     raw=evalicmp(pkt);
     assert(raw);

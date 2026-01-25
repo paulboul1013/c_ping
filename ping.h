@@ -16,13 +16,20 @@ typedef unsigned short int16;
 typedef unsigned int int32;
 typedef unsigned long long int64;
 
+#define show(x) _Generic((x), \
+    ip*:showip(# x,(ip*)x), \
+    icmp*:showicmp(# x,(icmp*)x) \
+)
 
 //icmp type
 enum e_type {
-    unassigned,
+    unassigned=0,
     echo,
-    echoreply
-};
+    echoreply,
+    L4icmp,
+    L4tcp,
+    L4udp
+} packed;
 
 typedef enum e_type type;
 
@@ -45,13 +52,38 @@ struct s_rawicmp{
 // size: 數據負載的大小（字節數）
 // data: 指向數據負載的指針
 struct s_icmp{
-    type kind;
+    type kind:3;
     int16 size;
     int8 *data;
 }packed;
 typedef struct s_icmp icmp;
 
+struct s_ip{
+    type kind:3;
+    int32 src;
+    int32 dst;
+    int16 id;
+    icmp *payload;
+} packed;
 
+typedef struct s_ip ip;
+
+struct s_rawip{
+    int8 version:4;
+    int8 ihl:4;
+    int8 dscp:6;
+    int8 ecn:2;
+    int16 length;
+    int16 id;
+    int8 flag:3;
+    int16 offset:13;
+    int8 ttl;
+    int8 protocol;
+    int16 checksum;
+    int32 src;
+    int32 dst;
+    int8 options[];
+} packed;
 
 int16 checksum(int8*,int16);//calculate checksum of icmp packet
 int16 endian16(int16);
@@ -59,5 +91,9 @@ int16 endian16(int16);
 //icmp
 icmp *mkicmp(type,const int8*,int16);//create icmp packet
 int8 *evalicmp(icmp*);//evaluate 's_icmp icmp' to raw icmp
-void showicmp(icmp*);//show icmp packet imfomration
+void showicmp(char*,icmp*);//show icmp packet imfomration
 
+//ip
+ip *mkip(type,const int8*,const int8*,int16,int16*);
+int8 *evalip(ip*);
+void showip(char *,ip*);
