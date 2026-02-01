@@ -1,4 +1,19 @@
+#define _POSIX_C_SOURCE 199309L
 #include "utils.h"
+#include "ping.h"
+
+void getnow(struct s_timestamp *ts) {
+    struct timespec tp;
+    clock_gettime(CLOCK_MONOTONIC, &tp);
+    ts->tv_sec = tp.tv_sec;
+    ts->tv_usec = tp.tv_nsec / 1000;
+}
+
+double difftime_ms(struct s_timestamp *start, struct s_timestamp *end) {
+    double sec_diff = (double)(end->tv_sec - start->tv_sec);
+    double usec_diff = (double)(end->tv_usec - start->tv_usec);
+    return sec_diff * 1000.0 + usec_diff / 1000.0;
+}
 
 void copy(int8 *dst, int8 *src, int16 size) {
     int8 *d, *s;
