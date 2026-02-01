@@ -1,84 +1,41 @@
-#define _POSIX_C_SOURCE 199309L
 #include "utils.h"
-#include "ping.h"
+#include <sys/time.h>
 
-void getnow(struct s_timestamp *ts) {
-    struct timespec tp;
-    clock_gettime(CLOCK_MONOTONIC, &tp);
-    ts->tv_sec = tp.tv_sec;
-    ts->tv_usec = tp.tv_nsec / 1000;
+/* ========== 時間相關函數 ========== */
+
+/**
+ * 獲取當前時間（微秒精度）
+ */
+uint64_t get_time_us(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000000 + tv.tv_usec;
 }
 
-double difftime_ms(struct s_timestamp *start, struct s_timestamp *end) {
-    double sec_diff = (double)(end->tv_sec - start->tv_sec);
-    double usec_diff = (double)(end->tv_usec - start->tv_usec);
-    return sec_diff * 1000.0 + usec_diff / 1000.0;
-}
+/* ========== 網絡相關函數 ========== */
 
-void copy(int8 *dst, int8 *src, int16 size) {
-    int8 *d, *s;
-    int16 n;
-
-    for (n=size, d=dst, s=src; n; n--)
-        *d++ = *s++;
-
-    return;
-}
-
-int16 nstoh(int16 srcport) {
-    int16 dstport;  
-    int8 a, b;
-
-    a = ((srcport & 0xff00) >> 8);
-    b = (srcport & 0xff);
-    dstport = 0;
-    dstport = (b << 8) + a;
-
-    return dstport;
-}
-
-void zero(int8 *str, int16 size) {
-    int8 *p;
-    int16 n;
-
-    for (n=0, p=str; n<size; n++, p++)
-        *p = 0;
-
-    return;
-}
-
-void printhex(int8 *str, int16 size, int8 delim) {
-    int8 *p;
-    int16 n;
-
-    for (p=str, n=size; n; n--, p++) {
-        printf("%.02x", *p);
-        if (delim)
-            printf("%c", delim);
-        fflush(stdout);
+/**
+ * 計算校驗和（RFC 1071）
+ */
+uint16_t compute_checksum(const void *buf, size_t len) {
+    const uint16_t *data = buf;
+    uint32_t sum = 0;
+    
+    /* 累加所有 16 位元字 */
+    while (len > 1) {
+        sum += *data++;
+        len -= 2;
     }
-    printf("\n");
-
-    return;
+    
+    /* 處理奇數字節 */
+    if (len == 1) {
+        sum += *(uint8_t *)data;
+    }
+    
+    /* 處理進位 */
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    
+    return (uint16_t)~sum;
 }
-
-
-int8 *todotted(in_addr_t ip) {
-    int8 a, b, c, d;
-    static int8 buf[16];
-
-    d = ((ip & 0xff000000) >> 24);
-    c = ((ip & 0xff0000) >> 16);
-    b = ((ip & 0xff00) >> 8);
-    a = ((ip & 0xff));
-
-    zero(buf, 16);
-    snprintf((char *)buf, 15, "%d.%d.%d.%d",
-        a, b, c, d);
-
-    return buf;
-}
-
-
-
-#pragma GCC diagnostic pop

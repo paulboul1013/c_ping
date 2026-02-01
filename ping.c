@@ -1,606 +1,320 @@
-#include "ping.h"
-#include <sys/socket.h>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
-#include <signal.h>
+#include <netinet/in_systm.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+#include <sys/socket.h>
 
-sint32 initsocket(void){
-    sint32 sockfd;
-    sint32 on=1;
-    struct timeval tv;
+#include "ping.h"
+#include "utils.h"
 
-    // 創建原始 ICMP socket
-    sockfd=socket(AF_INET,SOCK_RAW,IPPROTO_ICMP);
-    if(sockfd<0){
-        if(errno==EPERM){
-            fprintf(stderr,"socket: Operation not permitted. Need root privileges or CAP_NET_RAW capability.\n");
-        }else{
-            perror("socket");
-        }
-        return -1;
-    }
+/* ========== 全局變量 ========== */
 
-    // 設置 IP_HDRINCL 選項，因為我們自己構建 IP 頭
-    // 注意：在某些環境（如 WSL2）中，這可能導致發送失敗
-    if(setsockopt(sockfd,IPPROTO_IP,IP_HDRINCL,&on,sizeof(on))<0){
-        perror("setsockopt IP_HDRINCL");
-        close(sockfd);
-        return -1;
-    }
+volatile sig_atomic_t keep_running = 1;
 
-    // 設置 SO_BROADCAST 允許發送廣播
-    on=1;
-    if(setsockopt(sockfd,SOL_SOCKET,SO_BROADCAST,&on,sizeof(on))<0){
-        perror("setsockopt SO_BROADCAST");
-        // 非致命錯誤，繼續
-    }
+/* ========== Signal 處理 ========== */
 
-    // 設置接收超時 2 秒
-    tv.tv_sec=2;
-    tv.tv_usec=0;
-    if(setsockopt(sockfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv))<0){
-        perror("setsockopt SO_RCVTIMEO");
-        close(sockfd);
-        return -1;
-    }
-
-    return sockfd;
-}
-
-bool sendip(sint32 s,ip *pkt){
-    int8 *raw;
-    sint32 n;
-    int16 pktsize;
-    struct sockaddr_in dst;
-
-    if (s<0 || !pkt){
-        return false;
-    }
-
-    // 將應用層結構轉換為原始封包
-    raw=evalip(pkt);
-    if(!raw){
-        return false;
-    }
-
-    // 計算封包大小
-    pktsize=sizeof(struct s_rawip);
-    if(pkt->payload){
-        pktsize+=sizeof(struct s_rawicmp)+pkt->payload->size;
-    }
-
-    // 設置目標地址
-    zero((int8*)&dst,sizeof(dst));
-    dst.sin_family=AF_INET;
-    dst.sin_addr.s_addr=pkt->dst;
-
-    // 發送封包
-    n=sendto(s,raw,pktsize,0,(struct sockaddr*)&dst,sizeof(dst));
-
-    free(raw);
-
-    if(n<0){
-        perror("sendto");
-        return false;
-    }
-
-    return true;
-}
-
-ip *mkip(type kind, const int8 *src,const int8 *dst,int16 id_,int16 *cntptr){
-    int16 id;
-    int16 size;
-    ip *pkt;
-    if (!kind || !src || !dst ){
-        return (ip*)0;
-    }
-
-    if (id_) {
-        id=id_;
-    }
-    else{
-        id=*cntptr++;
-    }
-
-
-    size=sizeof(struct s_ip);
-    pkt=(ip*)malloc(size);
-    assert(pkt);
-    zero((int8*)pkt,size);
-
-    pkt->kind=kind;
-    pkt->id=id;
-    pkt->src=inet_addr((char*)src);
-    pkt->dst=inet_addr((char*)dst);
-    pkt->payload=(icmp*)0;
-
-    if (!pkt->dst){
-        free(pkt);
-        return (ip*)0;
-    }
-    return pkt;
-}
-    
-void showip(char *ident,ip *pkt){
-    if (!pkt){
-        return;
-    }
-
-    printf("(ip *)%s = {\n", ident);
-    printf("  kind:\t 0x%.02hhx\n",(char)pkt->kind);
-    printf("  id:\t 0x%.02hhx\n",pkt->id);
-    printf("  src:\t %s\n",todotted(pkt->src));
-    printf("  dst:\t %s\n",todotted(pkt->dst));
-    printf("}\n");
-
-    if (pkt->payload){
-        show(pkt->payload);
-    }
-
-}
-
-int8 *evalip(ip *pkt){
-    struct s_rawip rawpkt;
-    struct s_rawip *rawptr;
-    int16 check;
-    int16 size;
-    int8 *p,*ret;
-    int8 protocol;
-    int16 lengthle;
-    int8 *icmpptr;
-
-    if (!pkt){
-        return (int8 *)0;
-    }
-
-    protocol=0;
-    switch(pkt->kind){
-        case L4icmp:
-        protocol=1;
-        break;
-        case L4tcp:
-        protocol=6;
-        break;
-        case L4udp:
-        protocol=17;
-        break;
-        default:
-        return (int8 *)0;
-    }    
-
-    rawpkt.checksum=0;
-    rawpkt.dscp=0;
-    rawpkt.dst=pkt->dst;
-    rawpkt.ecn=0;
-    rawpkt.flag=0;
-    rawpkt.id=endian16(pkt->id);
-    rawpkt.ihl=(sizeof(struct s_rawip)/4);
-
-    lengthle=0;
-    if (pkt->payload){
-        lengthle=(rawpkt.ihl*4)+pkt->payload->size+sizeof(struct s_rawicmp);
-        rawpkt.length=endian16(lengthle);
-    }
-    else{
-        lengthle=(rawpkt.ihl*4);
-        rawpkt.length=endian16(lengthle);
-    }
-
-    rawpkt.offset=0;
-    rawpkt.protocol=protocol;
-    rawpkt.src=pkt->src;
-    rawpkt.ttl=250;
-    rawpkt.version=4;
-
-    if (lengthle%2){
-        lengthle++;
-    }
-
-    size=sizeof(struct s_rawip);
-    p=malloc(lengthle);
-    ret=p;
-    assert(p);
-    zero(p,lengthle);
-    copy(p,(int8*)&rawpkt,size);
-    p+=size;
-
-    if (pkt->payload){
-        icmpptr=evalicmp(pkt->payload);
-        if (icmpptr){
-            int16 icmpsize=sizeof(struct s_rawicmp)+pkt->payload->size;
-            copy(p,icmpptr,icmpsize);
-            free(icmpptr);
-        }
-    }
-
-    // IP 校驗和只計算 IP 頭部分，不包括 payload
-    check=checksum(ret,sizeof(struct s_rawip));
-    rawptr=(struct s_rawip *)ret;
-    rawptr->checksum=check;
-
-    return ret;
-
-}
-
-//0xaabb -> 0xbbaa
-int16 endian16(int16 x){
-    int a,b;
-    int16 y;
-    b=(x&0x00ff);
-    a=((x&0xff00)>>8);
-    y=(b<<8)|a;
-    return y;
-}
-
-int16 checksum(int8 *pkt,int16 size){
-
-    int16 *p;
-    int32 acc,b;
-    int16 carry,sum,n;
-    int16 ret;
-    acc=0;
-
-    for(n=size,p=(int16*)pkt;n;n-=2,p++){
-        b=*p;
-        acc+=b;
-    }
-    carry=(acc&0xffff0000)>>16;//acc for deferred carry
-    sum=(acc&0x0000ffff);
-
-    ret=~(sum+carry); //1's complement of the sum
-    
-    return endian16(ret);
-}
-
-int8 *evalicmp(icmp *pkt){
-    int8 *p,*ret;
-    int16 size;
-    struct s_rawicmp rawpkt;
-    struct s_rawicmp *rawptr;
-    int16 check;
-
-    if (!pkt || !pkt->data) {
-        return (int8 *)0;
-    }
-
-    switch(pkt->kind){
-        case echo:
-        rawpkt.type=8;
-        rawpkt.code=0;
-            break;
-        case echoreply:
-        rawpkt.type=0;
-        rawpkt.code=0;
-            break;
-        default:
-            return (int8 *)0;
-            break;
-    }
-
-    rawpkt.checksum=0;
-    rawpkt.identifier=endian16(pkt->identifier);
-    rawpkt.sequence=endian16(pkt->sequence);
-    size=sizeof(struct s_rawicmp)+pkt->size;
-    if (size%2){
-        size++;
-    }
-
-    //allocate memory for raw icmp packet
-    p= (int8 *)malloc(size);
-    ret=p;
-    assert(p);
-    zero((int8 *)p,size);
-
-    //copy metadata to raw icmp packet
-    copy(p,(int8 *)&rawpkt,sizeof(struct s_rawicmp));
-    p+=sizeof(struct s_rawicmp);
-    //copy data to raw icmp packet
-    copy(p,pkt->data,pkt->size);
-
-    //calculate checksum
-    check=checksum(ret,size);
-    
-    //set checksum to raw icmp packet
-    rawptr=(struct s_rawicmp *)ret;
-    rawptr->checksum=check;
-
-    return ret;
-}
-
-icmp *mkicmp(type kind,const int8 *data,int16 size,int16 identifier,int16 sequence){
-    int16 n;
-    icmp *p;
-
-    if (!data || !size) {
-        return (icmp*)0;
-    }
-    n=sizeof(struct s_icmp)+size;
-
-    p=(icmp*)malloc((int)n);
-    assert(p);
-
-    zero((int8 *)p,n);
-
-    p->kind=kind;
-    p->identifier=identifier;
-    p->sequence=sequence;
-    p->size=size;
-    p->data=(int8 *)data;
-
-    return p;
-
-}
-
-void showicmp(char *ident,icmp *pkt){
-    if(!pkt){
-        return;
-    }
-    printf("(icmp *)%s = {\n",ident);
-    printf("  kind:\t %s\n",(pkt->kind==echo)?"echo":"echo reply");
-    printf("  size:\t %d\n",(int)pkt->size);
-
-
-    printf("}\n");
-
-    printf("payload:\n");
-    if (pkt->data){
-        printhex(pkt->data,pkt->size,0);
-
-    }
-
-    return;
-}
-
-icmp *recvicmp(sint32 sockfd,sint32 *ttl_out){
-    int8 buf[2048];
-    struct sockaddr_in src;
-    socklen_t srclen;
-    sint32 n;
-    struct s_rawip *ipheader;
-    struct s_rawicmp *icmpheader;
-    int16 iphdrlen;
-    icmp *pkt;
-    int8 *payload;
-    int16 payloadsize;
-
-    if(!ttl_out){
-        return (icmp*)0;
-    }
-
-    zero(buf,sizeof(buf));
-    srclen=sizeof(src);
-
-    // 接收封包
-    n=recvfrom(sockfd,buf,sizeof(buf),0,(struct sockaddr*)&src,&srclen);
-    if(n<0){
-        if(errno==EAGAIN || errno==EWOULDBLOCK){
-            // 超時
-            return (icmp*)0;
-        }
-        perror("recvfrom");
-        return (icmp*)0;
-    }
-
-    // 解析 IP 頭
-    ipheader=(struct s_rawip*)buf;
-    iphdrlen=(ipheader->ihl)*4;
-    *ttl_out=(sint32)ipheader->ttl;
-
-    // 解析 ICMP 頭
-    icmpheader=(struct s_rawicmp*)(buf+iphdrlen);
-
-    // 只處理 echo reply (type=0)
-    if(icmpheader->type!=0){
-        return (icmp*)0;
-    }
-
-    // 提取 payload
-    payloadsize=n-iphdrlen-sizeof(struct s_rawicmp);
-    if(payloadsize<=0){
-        return (icmp*)0;
-    }
-
-    payload=(int8*)malloc(payloadsize);
-    assert(payload);
-    copy(payload,(int8*)(buf+iphdrlen+sizeof(struct s_rawicmp)),payloadsize);
-
-    // 創建應用層 icmp 結構
-    pkt=(icmp*)malloc(sizeof(struct s_icmp));
-    assert(pkt);
-    zero((int8*)pkt,sizeof(struct s_icmp));
-
-    pkt->kind=echoreply;
-    pkt->identifier=endian16(icmpheader->identifier);
-    pkt->sequence=endian16(icmpheader->sequence);
-    pkt->size=payloadsize;
-    pkt->data=payload;
-
-    return pkt;
-}
-
-// 統計結構
-struct ping_stats {
-    sint32 transmitted;
-    sint32 received;
-    double min_rtt;
-    double max_rtt;
-    double sum_rtt;
-};
-
-void init_stats(struct ping_stats *stats){
-    stats->transmitted=0;
-    stats->received=0;
-    stats->min_rtt=999999.0;
-    stats->max_rtt=0.0;
-    stats->sum_rtt=0.0;
-}
-
-void update_stats(struct ping_stats *stats,double rtt){
-    stats->received++;
-    stats->sum_rtt+=rtt;
-    if(rtt<stats->min_rtt){
-        stats->min_rtt=rtt;
-    }
-    if(rtt>stats->max_rtt){
-        stats->max_rtt=rtt;
-    }
-}
-
-void print_stats(struct ping_stats *stats,const int8 *target){
-    double loss;
-    double avg;
-
-    printf("\n--- %s ping statistics ---\n",target);
-    printf("%d packets transmitted, %d received, ",stats->transmitted,stats->received);
-
-    if(stats->transmitted>0){
-        loss=(double)(stats->transmitted-stats->received)*100.0/(double)stats->transmitted;
-        printf("%.1f%% packet loss\n",loss);
-    }else{
-        printf("0.0%% packet loss\n");
-    }
-
-    if(stats->received>0){
-        avg=stats->sum_rtt/(double)stats->received;
-        printf("rtt min/avg/max = %.3f/%.3f/%.3f ms\n",
-            stats->min_rtt,avg,stats->max_rtt);
-    }
-}
-
-// Signal handler
-volatile sig_atomic_t keep_running=1;
-
-void sigint_handler(int signum){
+void sigint_handler(int signum) {
     (void)signum;
-    keep_running=0;
+    keep_running = 0;
 }
 
-int main(int argc,char **argv){
-    sint32 sockfd;
-    int8 *target;
-    int16 identifier;
-    int16 sequence;
-    int8 *payload;
-    int16 payloadsize;
-    icmp *icmppkt;
-    ip *ippkt;
-    struct ping_stats stats;
-    timestamp send_time,recv_time;
-    icmp *reply;
-    sint32 ttl;
-    double rtt;
-    int16 ipcnt;
-    int8 src_ip[16];
+/* ========== 統計函數 ========== */
 
-    // 檢查參數
-    if(argc<2){
-        fprintf(stderr,"Usage: %s <target_ip>\n",argv[0]);
-        return 1;
+/**
+ * 初始化統計
+ */
+void init_stats(ping_stats_t *stats) {
+    stats->transmitted = 0;
+    stats->received = 0;
+    stats->min_rtt = 999999.0;
+    stats->max_rtt = 0.0;
+    stats->sum_rtt = 0.0;
+}
+
+/**
+ * 更新統計
+ */
+void update_stats(ping_stats_t *stats, double rtt_ms) {
+    stats->received++;
+    stats->sum_rtt += rtt_ms;
+    if (rtt_ms < stats->min_rtt) stats->min_rtt = rtt_ms;
+    if (rtt_ms > stats->max_rtt) stats->max_rtt = rtt_ms;
+}
+
+/**
+ * 顯示統計
+ */
+void print_stats(const ping_stats_t *stats, const char *host) {
+    double loss = 0.0;
+    
+    printf("\n--- %s ping statistics ---\n", host);
+    printf("%d packets transmitted, %d received, ", 
+           stats->transmitted, stats->received);
+    
+    if (stats->transmitted > 0) {
+        loss = (double)(stats->transmitted - stats->received) * 100.0 / 
+               stats->transmitted;
+    }
+    printf("%.1f%% packet loss\n", loss);
+    
+    if (stats->received > 0) {
+        double avg = stats->sum_rtt / stats->received;
+        printf("rtt min/avg/max = %.3f/%.3f/%.3f ms\n",
+               stats->min_rtt, avg, stats->max_rtt);
+    }
+}
+
+/* ========== ICMP 封包函數 ========== */
+
+/**
+ * 創建 ICMP echo request 封包
+ */
+void create_icmp_packet(icmp_packet_t *packet, uint16_t id, uint16_t seq) {
+    memset(packet, 0, sizeof(*packet));
+    
+    packet->header.type = ICMP_ECHO;
+    packet->header.code = 0;
+    packet->header.identifier = htons(id);
+    packet->header.sequence = htons(seq);
+    
+    /* 在 data 中填入時間戳 */
+    uint64_t timestamp = get_time_us();
+    memcpy(packet->data, &timestamp, sizeof(timestamp));
+    
+    /* 計算校驗和 */
+    packet->header.checksum = 0;
+    packet->header.checksum = compute_checksum(packet, sizeof(*packet));
+}
+
+/* ========== 其他工具函數 ========== */
+
+/**
+ * 設置 socket 為非阻塞模式
+ */
+int set_nonblocking(int sockfd) {
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags == -1) {
+        return -1;
+    }
+    return fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/**
+ * 顯示使用說明
+ */
+void print_usage(const char *prog_name) {
+    fprintf(stderr, "Usage: %s [-n count] <hostname or IP>\n", prog_name);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -n count    發送封包的次數（預設: 4）\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  %s google.com           # 發送 4 次\n", prog_name);
+    fprintf(stderr, "  %s -n 10 8.8.8.8        # 發送 10 次\n", prog_name);
+    fprintf(stderr, "  %s -n 0 1.1.1.1         # 無限發送（Ctrl+C 停止）\n", prog_name);
+}
+
+/* ========== 主函數 ========== */
+
+/**
+ * 主函數
+ */
+int main(int argc, char *argv[]) {
+    const char *hostname = NULL;
+    int count = 4;  /* 預設發送 4 次，像 Windows ping */
+    struct addrinfo hints, *addrinfo_list, *ai;
+    int sockfd = -1;
+    struct sockaddr_storage dest_addr;
+    socklen_t dest_addr_len;
+    char addr_str[INET6_ADDRSTRLEN];
+    uint16_t id = (uint16_t)getpid();
+    uint16_t seq = 0;
+    ping_stats_t stats;
+    int error;
+    int opt;
+
+    /* 解析命令列參數 */
+    while ((opt = getopt(argc, argv, "n:h")) != -1) {
+        switch (opt) {
+            case 'n':
+                count = atoi(optarg);
+                if (count < 0) {
+                    fprintf(stderr, "錯誤: count 必須 >= 0\n");
+                    return 1;
+                }
+                break;
+            case 'h':
+                print_usage(argv[0]);
+                return 0;
+            default:
+                print_usage(argv[0]);
+                return 1;
+        }
     }
 
-    target=(int8*)argv[1];
-
-    // 初始化 socket
-    sockfd=initsocket();
-    if(sockfd<0){
-        fprintf(stderr,"Failed to create socket. Need root privileges or CAP_NET_RAW capability.\n");
+    /* 獲取主機名（最後一個非選項參數） */
+    if (optind >= argc) {
+        fprintf(stderr, "錯誤: 缺少主機名或 IP 地址\n\n");
+        print_usage(argv[0]);
         return 1;
     }
-
-    if(sockfd==0){
-        fprintf(stderr,"Invalid socket fd.\n");
+    hostname = argv[optind];
+    
+    /* 設置 signal handler */
+    signal(SIGINT, sigint_handler);
+    
+    /* 解析主機名 */
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;      /* IPv4 */
+    hints.ai_socktype = SOCK_RAW;
+    hints.ai_protocol = IPPROTO_ICMP;
+    
+    error = getaddrinfo(hostname, NULL, &hints, &addrinfo_list);
+    if (error != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(error));
         return 1;
     }
+    
+    /* 創建 socket */
+    for (ai = addrinfo_list; ai != NULL; ai = ai->ai_next) {
+        sockfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (sockfd >= 0) {
+            memcpy(&dest_addr, ai->ai_addr, ai->ai_addrlen);
+            dest_addr_len = ai->ai_addrlen;
+            break;
+        }
+    }
+    
+    if (sockfd < 0) {
+        perror("socket");
+        fprintf(stderr, "Error: Need root privileges or CAP_NET_RAW capability\n");
+        fprintf(stderr, "Try: sudo %s %s\n", argv[0], hostname);
+        freeaddrinfo(addrinfo_list);
+        return 1;
+    }
+    
+    /* 設置非阻塞模式 */
+    if (set_nonblocking(sockfd) < 0) {
+        perror("set_nonblocking");
+        close(sockfd);
+        freeaddrinfo(addrinfo_list);
+        return 1;
+    }
+    
+    /* 轉換 IP 地址為字串 */
+    inet_ntop(dest_addr.ss_family,
+              &((struct sockaddr_in *)&dest_addr)->sin_addr,
+              addr_str, sizeof(addr_str));
+    
+    freeaddrinfo(addrinfo_list);
+    
+    /* Drop privileges（如果使用 setuid） */
+    if (getuid() != geteuid()) {
+        if (setuid(getuid()) != 0) {
+            perror("setuid");
+        }
+    }
+    
+    printf("PING %s (%s) %zu data bytes\n",
+           hostname, addr_str, PACKET_SIZE - sizeof(icmp_header_t));
 
-    // 設置 signal handler
-    signal(SIGINT,sigint_handler);
-
-    // 初始化統計
     init_stats(&stats);
 
-    // 設置識別符（使用 process ID）
-    identifier=(int16)getpid();
-    sequence=0;
-    ipcnt=0;
-
-    // 獲取本機 IP（簡化版，使用固定值）
-    snprintf((char*)src_ip,sizeof(src_ip),"127.0.0.1");
-
-    printf("PING %s 56 data bytes\n",target);
-
-    // 主循環
-    while(keep_running){
-        sequence++;
-
-        // 創建 payload（包含時間戳）
-        payloadsize=56;
-        payload=(int8*)malloc(payloadsize);
-        assert(payload);
-        zero(payload,payloadsize);
-
-        // 記錄發送時間到 payload
-        getnow(&send_time);
-        copy(payload,(int8*)&send_time,sizeof(timestamp));
-
-        // 創建 ICMP echo request
-        icmppkt=mkicmp(echo,payload,payloadsize,identifier,sequence);
-        assert(icmppkt);
-
-        // 創建 IP 封包
-        ippkt=mkip(L4icmp,src_ip,target,0,&ipcnt);
-        if(!ippkt){
-            fprintf(stderr,"Invalid target IP address\n");
-            free(payload);
-            free(icmppkt);
-            break;
-        }
-        ippkt->payload=icmppkt;
-
-        // 發送封包
-        if(!sendip(sockfd,ippkt)){
-            fprintf(stderr,"Failed to send packet\n");
-            free(payload);
-            free(icmppkt);
-            free(ippkt);
+    /* 主循環 - count=0 表示無限循環 */
+    while (keep_running && (count == 0 || seq < count)) {
+        icmp_packet_t request;
+        uint64_t send_time, recv_time;
+        
+        /* 創建並發送 ICMP echo request */
+        create_icmp_packet(&request, id, seq);
+        
+        send_time = get_time_us();
+        
+        ssize_t sent = sendto(sockfd, &request, sizeof(request), 0,
+                             (struct sockaddr *)&dest_addr, dest_addr_len);
+        if (sent < 0) {
+            perror("sendto");
             break;
         }
         stats.transmitted++;
-
-        // 接收 reply
-        reply=recvicmp(sockfd,&ttl);
-        getnow(&recv_time);
-
-        if(reply && reply->identifier==identifier && reply->sequence==sequence){
-            // 從 reply payload 提取發送時間
-            if(reply->size>=sizeof(timestamp)){
-                copy((int8*)&send_time,reply->data,sizeof(timestamp));
-                rtt=difftime_ms(&send_time,&recv_time);
-
-                printf("64 bytes from %s: icmp_seq=%d ttl=%d time=%.3f ms\n",
-                    target,sequence,ttl,rtt);
-
-                update_stats(&stats,rtt);
+        
+        /* 接收 reply（帶超時） */
+        int received = 0;
+        while (!received) {
+            char buf[1024];
+            ssize_t n = recvfrom(sockfd, buf, sizeof(buf), 0, NULL, NULL);
+            
+            recv_time = get_time_us();
+            uint64_t elapsed = recv_time - send_time;
+            
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    /* No data yet */
+                    if (elapsed > REQUEST_TIMEOUT_US) {
+                        printf("Request timeout for icmp_seq %d\n", seq);
+                        break;
+                    }
+                    usleep(1000); /* Wait 1ms before trying again */
+                    continue;
+                } else {
+                    perror("recvfrom");
+                    break;
+                }
             }
-
-            free(reply->data);
-            free(reply);
-        }else{
-            printf("Request timeout for icmp_seq %d\n",sequence);
+            
+            /* 解析 IP 頭 */
+            struct ip *ip_hdr = (struct ip *)buf;
+            size_t ip_hdr_len = ip_hdr->ip_hl * 4;
+            
+            /* 解析 ICMP 頭 */
+            icmp_packet_t *reply = (icmp_packet_t *)(buf + ip_hdr_len);
+            
+            /* 驗證是 echo reply */
+            if (reply->header.type != ICMP_ECHOREPLY) {
+                continue;
+            }
+            
+            /* 驗證 ID 和 sequence */
+            if (ntohs(reply->header.identifier) != id ||
+                ntohs(reply->header.sequence) != seq) {
+                continue;
+            }
+            
+            /* 計算 RTT */
+            uint64_t request_time;
+            memcpy(&request_time, reply->data, sizeof(request_time));
+            double rtt_ms = (recv_time - request_time) / 1000.0;
+            
+            printf("%zd bytes from %s: icmp_seq=%d ttl=%d time=%.3f ms\n",
+                   n - ip_hdr_len, addr_str, seq, ip_hdr->ip_ttl, rtt_ms);
+            
+            update_stats(&stats, rtt_ms);
+            received = 1;
         }
-
-        // 清理
-        free(payload);
-        free(icmppkt);
-        free(ippkt);
-
-        // 等待 1 秒
-        sleep(1);
+        
+        seq++;
+        
+        /* 等待間隔 */
+        uint64_t wait_time = REQUEST_INTERVAL_US - (get_time_us() - send_time);
+        if (wait_time > 0 && wait_time < REQUEST_INTERVAL_US) {
+            usleep(wait_time);
+        }
     }
-
-    // 顯示統計
-    print_stats(&stats,target);
-
-    // 關閉 socket
+    
+    /* 顯示統計 */
+    print_stats(&stats, hostname);
+    
     close(sockfd);
-
     return 0;
 }

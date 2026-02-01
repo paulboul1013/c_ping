@@ -1,39 +1,21 @@
-#pragma once
-#pragma GCC diagnostic ignored "-Wstringop-truncation"
-#pragma GCC diagnostic ignored "-Wformat-truncation="
-#pragma GCC diagnostic push
+#ifndef UTILS_H
+#define UTILS_H
 
-#include <stdio.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <time.h>
+#include <stdint.h>
+#include <stddef.h>
 
-typedef unsigned char int8;
-typedef unsigned short int int16;
-typedef unsigned int int32;
-typedef unsigned long long int64;
+/* ========== 時間相關函數 ========== */
 
-// 前向聲明（結構在 ping.h）
-struct s_timestamp;
+/**
+ * 獲取當前時間（微秒精度）
+ */
+uint64_t get_time_us(void);
 
-/* C */
-void copy(int8*,int8*,int16);
+/* ========== 網絡相關函數 ========== */
 
-/* D */
-double difftime_ms(struct s_timestamp*, struct s_timestamp*);
+/**
+ * 計算校驗和（RFC 1071）
+ */
+uint16_t compute_checksum(const void *buf, size_t len);
 
-/* G */
-void getnow(struct s_timestamp*);
-
-/* N */
-int16 nstoh(int16);
-
-/* P */
-void printhex(int8*,int16,int8);
-
-/* T */
-int8 *todotted(in_addr_t);
-
-/* Z */
-void zero(int8*,int16);
+#endif /* UTILS_H */
